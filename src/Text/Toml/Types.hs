@@ -1,100 +1,87 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
-
+{-# LANGUAGE LambdaCase #-}
 module Text.Toml.Types (
     Table
   , Node (VTable,VTArray,VString,VInteger,VFloat,VBoolean,VDatetime,VArray)
   , ToBsJSON (..)
-  , foldTable
   , emptyTable
   , insert
   ) where
+
+import           Control.Monad.State
 
 import           Data.Aeson.Types
 import qualified Data.HashMap.Strict as M
 import           Data.Int            (Int64)
 import           Data.List           (intersect)
+import           Data.Set (Set)
+import qualified Data.Set            as S
 import           Data.Text           (Text)
 import qualified Data.Text           as T
 import           Data.Time.Clock     (UTCTime)
 import           Data.Time.Format    ()
 import qualified Data.Vector         as V
 
+import           Text.Parsec hiding (State)
 
 -- | The 'Table' is a mapping ('HashMap') of 'Text' keys to 'Node' values.
 type Table = M.HashMap Text Node
 
 -- | A 'Node' may contain any type of value that can put in a 'VArray'.
 data Node = VTable    Table
-          | VITable   Table
           | VTArray   [Table]
-          | VString   Text
-          | VInteger  Int64
-          | VFloat    Double
-          | VBoolean  Bool
-          | VDatetime UTCTime
+          | VString   !Text
+          | VInteger  !Int64
+          | VFloat    !Double
+          | VBoolean  !Bool
+          | VDatetime !UTCTime
           | VArray    [Node]
   deriving (Eq, Show)
-
--- Turn VITables in VTables
-foldTable :: Table -> Table
-foldTable = M.map go
-  where
-    go (VTable t) =  VTable $ foldTable t
-    go (VITable t) = VTable $ foldTable t
-    go (VTArray t) = VTArray $ fmap foldTable t
-    go other = other
 
 -- | Contruct an empty 'Table'.
 emptyTable :: Table
 emptyTable = M.empty
 
 -- | Inserts a table ('Table') with name ('[Text]') which may be part of
--- a table array (when 'Bool' is 'True') into a 'Table'.
--- It may result in an error ('Text') on the 'Left' or a modified table
--- on the 'Right'.
-insert :: ([Text], Node) -> Table -> Either Text Table
-insert ([], _)         _ = Left "FATAL: Cannot call 'insert' without a name."
-insert ([name], node) ttbl =
+-- a table array into a 'Table'.
+-- It may result in an error in the ParsecT Monad for redefinitions.
+insert :: Bool -> ([Text], Node) -> Table -> ParsecT Text () (State (Set [Text])) Table
+insert _ ([], _)         _ = parserFail "FATAL: Cannot call 'insert' without a name."
+insert explicit ([name], node) ttbl =
     -- In case 'name' is final
     case M.lookup name ttbl of
-      Nothing           -> Right $ M.insert name node ttbl
-      Just (VITable t)  -> case node of
-        (VITable nt) -> case merge t nt of
-          Left ds -> Left $ T.concat [ "Cannot redefine key(s) (", (T.intercalate ", " ds)
-                                     , "), from table named '", name, "'." ]
-          Right r -> Right $ M.insert name (VITable r) ttbl
-        (VTable nt) -> case merge t nt of
-          Left ds -> Left $ T.concat [ "Cannot redefine key(s) (", (T.intercalate ", " ds)
-                                     , "), from table named '", name, "'." ]
-          Right r -> Right $ M.insert name (VTable r) ttbl
-        _         -> commonInsertError node [name]
+      Nothing           -> do
+        when explicit $ lift $ modify $ S.insert [name]
+        return $ M.insert name node ttbl
       Just (VTable t)   -> case node of
-        (VITable nt) -> case merge t nt of
-          Left ds -> Left $ T.concat [ "Cannot redefine key(s) (", (T.intercalate ", " ds)
-                                     , "), from table named '", name, "'." ]
-          Right r -> Right $ M.insert name (VTable r) ttbl
+        (VTable nt) -> case merge t nt of
+          Left ds -> parserFail . T.unpack $ T.concat [ "Cannot redefine key(s) (", (T.intercalate ", " ds)
+                                                      , "), from table named '", name, "'." ]
+          Right r -> do
+            when explicit $ testAndUpdateExplicts [name] node
+            return $ M.insert name (VTable r) ttbl
         _         -> commonInsertError node [name]
       Just (VTArray a)  -> case node of
-        (VTArray na) -> Right $ M.insert name (VTArray $ a ++ na) ttbl
+        (VTArray na) -> return $ M.insert name (VTArray $ a ++ na) ttbl
         _            -> commonInsertError node [name]
       Just _            -> commonInsertError node [name]
-insert (fullName@(name:ns), node) ttbl =
+insert explicit (fullName@(name:ns), node) ttbl =
     -- In case 'name' is not final, but a sub-name
     case M.lookup name ttbl of
-      Nothing           -> case insert (ns, node) emptyTable of
-                             Left msg -> Left msg
-                             Right r  -> Right $ M.insert name (VITable r) ttbl
-      Just (VTable t)   -> case insert (ns, node) t of
-                             Left msg -> Left msg
-                             Right tt -> Right $ M.insert name (VTable tt) ttbl
-      Just (VITable t)  -> case insert (ns, node) t of
-                             Left msg -> Left msg
-                             Right tt -> Right $ M.insert name (VITable tt) ttbl
-      Just (VTArray []) -> Left "FATAL: Call to 'insert' found impossibly empty VArray."
-      Just (VTArray a)  -> case insert (ns, node) (last a) of
-                             Left msg -> Left msg
-                             Right t  -> Right $ M.insert name (VTArray $ (init a) ++ [t]) ttbl
+      Nothing           -> insert False (ns, node) emptyTable >>= \r -> do
+                             when explicit $ lift $ modify $ S.insert fullName
+                             return $ M.insert name (VTable r) ttbl
+      Just (VTable t)   -> insert False (ns, node) t >>= \tt ->
+        case node of
+          -- VTArrays can be defined multiple times with the same key explicitly
+          (VTArray _ ) -> return $ M.insert name (VTable tt) ttbl
+          _ -> do
+            when explicit $ testAndUpdateExplicts fullName node
+            return $ M.insert name (VTable tt) ttbl
+      Just (VTArray []) -> parserFail "FATAL: Call to 'insert' found impossibly empty VArray."
+      Just (VTArray a)  -> insert False (ns, node) (last a) >>= \t ->
+                             return $ M.insert name (VTArray $ (init a) ++ [t]) ttbl
       Just _            -> commonInsertError node fullName
 
 
@@ -106,15 +93,21 @@ merge existing new = case intersect (M.keys existing) (M.keys new) of
                        [] -> Right $ M.union existing new
                        ds -> Left  $ ds
 
-commonInsertError :: Node -> [Text] -> Either Text Table
-commonInsertError what name = Left . T.concat $ case what of
+commonInsertError :: Monad m => Node -> [Text] -> ParsecT Text () m a
+commonInsertError what name = parserFail . concat $ case what of
     _         -> ["Cannot insert ", w, " '", n, "' as key already exists."]
   where
-    n = T.intercalate "." name
+    n = T.unpack $ T.intercalate "." name
     w = case what of (VTable _)  -> "tables"
-                     (VITable _) -> "tables"
                      _           -> "array of tables"
 
+testAndUpdateExplicts :: [Text] -> Node -> ParsecT Text () (State (Set [Text])) ()
+testAndUpdateExplicts name node = do
+  alreadyDefinedExplicity <- lift get
+  if S.member name alreadyDefinedExplicity
+    then commonInsertError node name
+    else return ()
+  lift $ put $ S.insert name alreadyDefinedExplicity
 
 -- * Regular ToJSON instances
 
@@ -122,7 +115,6 @@ commonInsertError what name = Left . T.concat $ case what of
 -- in line with the TOML specification.
 instance ToJSON Node where
   toJSON (VTable v)    = toJSON v
-  toJSON (VITable v)   = toJSON v
   toJSON (VTArray v)   = toJSON v
   toJSON (VString v)   = toJSON v
   toJSON (VInteger v)  = toJSON v
@@ -162,7 +154,6 @@ instance (ToBsJSON v) => ToBsJSON (M.HashMap Text v) where
 -- specifies the types of the values.
 instance ToBsJSON Node where
   toBsJSON (VTable v)    = toBsJSON v
-  toBsJSON (VITable v)   = toBsJSON v
   toBsJSON (VTArray v)   = toBsJSON v
   toBsJSON (VString v)   = object [ "type"  .= toJSON ("string" :: String)
                                   , "value" .= toJSON v ]
