@@ -3,7 +3,7 @@
 {-# LANGUAGE LambdaCase #-}
 module Text.Toml.Types (
     Table
-  , Node (VTable,VTArray,VString,VInteger,VFloat,VBoolean,VDatetime,VArray)
+  , Node (..)
   , ToBsJSON (..)
   , emptyTable
   , insert
