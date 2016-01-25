@@ -101,17 +101,14 @@ commonInsertError what name = parserFail . concat $ case what of
                      _           -> "array of tables"
 
 testAndUpdateExplicts :: Bool -> [Text] -> Node -> ParsecT Text () (State (Set [Text])) ()
-testAndUpdateExplicts explicit name node =
-  when (explicit && isVTable node) $ do
-    alreadyDefinedExplicity <- lift get
-    if S.member name alreadyDefinedExplicity
-      then commonInsertError node name
-      else return ()
-    lift $ put $ S.insert name alreadyDefinedExplicity
+testAndUpdateExplicts True name node@(VTable _ ) = do
+  alreadyDefinedExplicity <- lift get
+  if S.member name alreadyDefinedExplicity
+    then commonInsertError node name
+    else return ()
+  lift $ put $ S.insert name alreadyDefinedExplicity
 
-isVTable :: Node -> Bool
-isVTable (VTable _ ) = True
-isVTable _           = False
+testAndUpdateExplicts _ _ _ = return ()
 
 -- * Regular ToJSON instances
 
