@@ -52,14 +52,14 @@ insert explicit ([name], node) ttbl =
     -- In case 'name' is final
     case M.lookup name ttbl of
       Nothing           -> do
-        when explicit $ lift $ modify $ S.insert [name]
+        testAndUpdateExplicts explicit [name] node
         return $ M.insert name node ttbl
       Just (VTable t)   -> case node of
         (VTable nt) -> case merge t nt of
           Left ds -> parserFail . T.unpack $ T.concat [ "Cannot redefine key(s) (", (T.intercalate ", " ds)
                                                       , "), from table named '", name, "'." ]
           Right r -> do
-            when explicit $ testAndUpdateExplicts [name] node
+            testAndUpdateExplicts explicit [name] node
             return $ M.insert name (VTable r) ttbl
         _         -> commonInsertError node [name]
       Just (VTArray a)  -> case node of
@@ -69,19 +69,18 @@ insert explicit ([name], node) ttbl =
 insert explicit (fullName@(name:ns), node) ttbl =
     -- In case 'name' is not final, but a sub-name
     case M.lookup name ttbl of
-      Nothing           -> insert False (ns, node) emptyTable >>= \r -> do
-                             when explicit $ lift $ modify $ S.insert fullName
-                             return $ M.insert name (VTable r) ttbl
-      Just (VTable t)   -> insert False (ns, node) t >>= \tt ->
-        case node of
-          -- VTArrays can be defined multiple times with the same key explicitly
-          (VTArray _ ) -> return $ M.insert name (VTable tt) ttbl
-          _ -> do
-            when explicit $ testAndUpdateExplicts fullName node
-            return $ M.insert name (VTable tt) ttbl
+      Nothing           -> do
+        r <- insert False (ns, node) emptyTable
+        testAndUpdateExplicts explicit fullName node
+        return $ M.insert name (VTable r) ttbl
+      Just (VTable t)   -> do
+        r <- insert False (ns, node) t
+        testAndUpdateExplicts explicit fullName node
+        return $ M.insert name (VTable r) ttbl
       Just (VTArray []) -> parserFail "FATAL: Call to 'insert' found impossibly empty VArray."
-      Just (VTArray a)  -> insert False (ns, node) (last a) >>= \t ->
-                             return $ M.insert name (VTArray $ (init a) ++ [t]) ttbl
+      Just (VTArray a)  -> do
+        r <- insert False (ns, node) (last a)
+        return $ M.insert name (VTArray $ (init a) ++ [r]) ttbl
       Just _            -> commonInsertError node fullName
 
 
@@ -101,13 +100,18 @@ commonInsertError what name = parserFail . concat $ case what of
     w = case what of (VTable _)  -> "tables"
                      _           -> "array of tables"
 
-testAndUpdateExplicts :: [Text] -> Node -> ParsecT Text () (State (Set [Text])) ()
-testAndUpdateExplicts name node = do
-  alreadyDefinedExplicity <- lift get
-  if S.member name alreadyDefinedExplicity
-    then commonInsertError node name
-    else return ()
-  lift $ put $ S.insert name alreadyDefinedExplicity
+testAndUpdateExplicts :: Bool -> [Text] -> Node -> ParsecT Text () (State (Set [Text])) ()
+testAndUpdateExplicts explicit name node =
+  when (explicit && isVTable node) $ do
+    alreadyDefinedExplicity <- lift get
+    if S.member name alreadyDefinedExplicity
+      then commonInsertError node name
+      else return ()
+    lift $ put $ S.insert name alreadyDefinedExplicity
+
+isVTable :: Node -> Bool
+isVTable (VTable _ ) = True
+isVTable _           = False
 
 -- * Regular ToJSON instances
 

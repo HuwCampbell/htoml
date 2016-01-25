@@ -48,9 +48,10 @@ tomlDoc = do
     skipBlanks
     topTable <- table
     namedSections <- many namedSection
-    eof  -- ensures input is completely consumed
+    -- ensure the input is completely consumed
+    eof
+    -- Load each named section into the top table
     foldM (flip (insert True)) topTable namedSections
-
 
 -- | Parses a table of key-value pairs.
 table :: Parser Table
